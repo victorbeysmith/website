@@ -12,7 +12,7 @@
       width: 100vw;
       height: 100vh;
       overflow: hidden;
-      background: #FFF9E5; /* Cream */
+      background: #000;
     }
     body {
       width: 100vw;
@@ -24,16 +24,614 @@
       min-width: 100vw;
       position: relative;
     }
+    
+    #sparkleCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+    }
+    
     .center-text {
       font-family: 'Fira Mono', 'Consolas', 'Menlo', 'Monaco', monospace;
       font-size: 2rem;
-      color: #111;
-      z-index: 1;
+      color: #FFF;
+      z-index: 10;
       user-select: none;
+      pointer-events: none;
+      text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8), -1px -1px 2px rgba(0, 0, 0, 0.5);
     }
   </style>
 </head>
 <body>
+  <canvas id="sparkleCanvas"></canvas>
   <div class="center-text">Bey-Smith</div>
+  
+  <script>
+    const canvas = document.getElementById('sparkleCanvas');
+    const ctx = canvas.getContext('2d');
+  
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+  
+    // Viewport position (world offset)
+    let viewportX = 0;
+    let viewportY = 0;
+  
+    // Panning state
+    let isPanning = false;
+    let lastX = 0;
+    let lastY = 0;
+  
+    // Inertial scrolling (momentum)
+    let velocityX = 0; // in "viewport units per ms"
+    let velocityY = 0;
+    let lastMoveTime = 0;
+    const friction = 0.95;
+    const minVelocity = 0.1;
+
+    let lastWheelTime = 0;
+    let wheelActiveUntil = 0;
+
+    // Tuneables
+    const wheelMomentumDelay = 60;  // ms after last wheel event before momentum kicks in
+    const wheelDtMin = 8;           // ms clamp (prevents divide-by-tiny)
+    const wheelDtMax = 40;          // ms clamp
+    const wheelSmoothing = 0.25;    // 0..1 (higher = more responsive, lower = smoother)
+    const maxWheelVelocity = 3.0;   // px/ms clamp (prevents insane jumps)
+
+  
+    // -----------------------------
+    // Deterministic (seeded) starfield
+    // -----------------------------
+    const WORLD_SEED = 1337;
+  
+    // Cell-based generation: stable star positions while panning
+    const CELL_SIZE = 512;          // px (world space)
+    const starDensity = 0.0003;     // stars per pixel^2
+    const MAX_CELLS = 160;          // cache limit (performance/memory)
+  
+    // Map: "cx,cy" -> { stars: Star[], lastUsed: number }
+    const cellMap = new Map();
+  
+    // Fast 32-bit hash for (cx, cy)
+    function hash2D(cx, cy) {
+      // Mix coordinates deterministically into 32-bit int
+      let h = 2166136261 ^ WORLD_SEED;
+      h = Math.imul(h ^ cx, 16777619);
+      h = Math.imul(h ^ cy, 16777619);
+      // avalanche
+      h ^= h >>> 13;
+      h = Math.imul(h, 1274126177);
+      h ^= h >>> 16;
+      return h >>> 0;
+    }
+  
+    // Mulberry32 PRNG from a 32-bit seed
+    function mulberry32(seed) {
+      return function () {
+        let t = seed += 0x6D2B79F5;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+  
+    function cellKey(cx, cy) {
+      return `${cx},${cy}`;
+    }
+  
+    function getOrCreateCell(cx, cy, now) {
+      const key = cellKey(cx, cy);
+      let cell = cellMap.get(key);
+      if (cell) {
+        cell.lastUsed = now;
+        return cell;
+      }
+  
+      const rng = mulberry32(hash2D(cx, cy));
+      const cellArea = CELL_SIZE * CELL_SIZE;
+      const count = Math.floor(cellArea * starDensity);
+  
+      const stars = [];
+      const baseX = cx * CELL_SIZE;
+      const baseY = cy * CELL_SIZE;
+  
+      for (let i = 0; i < count; i++) {
+        const x = baseX + rng() * CELL_SIZE;
+        const y = baseY + rng() * CELL_SIZE;
+  
+        // Tiny drift in px/ms (time-based for smooth movement)
+        // 0.0012 px/ms ≈ 0.02 px/frame at 60fps
+        const vx = (rng() - 0.5) * 0.006;
+        const vy = (rng() - 0.5) * 0.006;
+  
+        const size = rng() * 1.5 + 0.5;
+        const baseOpacity = rng() * 0.5 + 0.3;
+        // Depth for parallax: 0.5 (close/fast parallax) to 1.5 (far/slow parallax)
+        const depth = rng() * 1.0 + 0.5;
+  
+        stars.push(new Star(x, y, false, { vx, vy, size, baseOpacity, depth }));
+      }
+  
+      cell = { stars, lastUsed: now };
+      cellMap.set(key, cell);
+      return cell;
+    }
+  
+    function cleanupCells(minCx, maxCx, minCy, maxCy, now) {
+      // Remove cells far outside range (keep a buffer)
+      const buffer = 2;
+      for (const [key, cell] of cellMap) {
+        const [cxStr, cyStr] = key.split(',');
+        const cx = Number(cxStr);
+        const cy = Number(cyStr);
+  
+        const outside =
+          cx < (minCx - buffer) || cx > (maxCx + buffer) ||
+          cy < (minCy - buffer) || cy > (maxCy + buffer);
+  
+        if (outside) {
+          // Optional: keep recently-used far cells for a moment
+          // but simplest is remove if outside buffer.
+          cellMap.delete(key);
+        }
+      }
+  
+      // Enforce MAX_CELLS with LRU eviction (if still too many)
+      if (cellMap.size > MAX_CELLS) {
+        const entries = Array.from(cellMap.entries());
+        entries.sort((a, b) => a[1].lastUsed - b[1].lastUsed); // oldest first
+        const toRemove = cellMap.size - MAX_CELLS;
+        for (let i = 0; i < toRemove; i++) {
+          cellMap.delete(entries[i][0]);
+        }
+      }
+    }
+  
+    // -----------------------------
+    // Star class (normal + shooting)
+    // -----------------------------
+    class Star {
+      constructor(x, y, isShooting = false, opts = {}) {
+        this.x = x;
+        this.y = y;
+  
+        this.isShooting = isShooting;
+  
+        // Normal star params (allow deterministic injection)
+        // Velocities in px/ms for time-based smooth movement
+        this.vx = opts.vx ?? (Math.random() - 0.5) * 0.0012;
+        this.vy = opts.vy ?? (Math.random() - 0.5) * 0.0012;
+        this.size = opts.size ?? (Math.random() * 1.5 + 0.5);
+        
+        // Parallax depth: 0.5 (close/fast parallax) to 1000.5 (far/slow parallax)
+        // Lower depth = closer = moves more relative to viewport
+        // Higher depth = farther = moves less relative to viewport
+        this.depth = opts.depth ?? (Math.random() * 10.0 + 0.5);
+  
+        // Fade-in
+        this.fadeInDuration = 600;
+        this.baseOpacity = opts.baseOpacity ?? (Math.random() * 0.5 + 0.3);
+        this.opacity = 0;
+  
+        // IMPORTANT: fade on first time it ENTERS the screen, not creation time.
+        this.firstSeen = false;
+        this.creationTime = performance.now();
+  
+        // Shooting star params
+        this.shootingStartTime = isShooting ? performance.now() : 0;
+        this.shootingDuration = 150;
+        this.trail = [];
+        this.trailEndTime = 0;
+  
+        if (isShooting) {
+          this.opacity = 0;
+          this.size = 2.5;
+          // vx/vy set by createShootingStar
+        }
+      }
+  
+      isOnScreen(margin = 0) {
+        // Use parallax-adjusted position for screen check
+        // Close stars (depth ~0.5) move more, far stars (depth ~1.5) move less
+        const screenX = this.x - viewportX / this.depth;
+        const screenY = this.y - viewportY / this.depth;
+        return (
+          screenX > -margin &&
+          screenX < canvas.width + margin &&
+          screenY > -margin &&
+          screenY < canvas.height + margin
+        );
+      }
+  
+      update(deltaTime) {
+        if (this.isShooting) {
+          const elapsed = performance.now() - this.shootingStartTime;
+          const progress = Math.min(elapsed / this.shootingDuration, 1);
+  
+          // Store trail points
+          if (
+            this.trail.length === 0 ||
+            performance.now() - (this.trail[this.trail.length - 1]?.time || 0) > 10
+          ) {
+            this.trail.push({ x: this.x, y: this.y, time: performance.now() });
+          }
+  
+          // Move (vx/vy are px/ms)
+          this.x += this.vx * deltaTime;
+          this.y += this.vy * deltaTime;
+  
+          // Opacity envelope
+          if (progress < 0.1) this.opacity = progress / 0.1;
+          else if (progress < 0.7) this.opacity = 1;
+          else this.opacity = Math.max(0, (1 - progress) / 0.3);
+  
+          if (progress >= 1) {
+            if (this.trailEndTime === 0) this.trailEndTime = performance.now();
+  
+            const trailDuration = 500;
+            this.trail = this.trail.filter((p) => performance.now() - p.time < trailDuration);
+  
+            const trailElapsed = performance.now() - this.trailEndTime;
+            const trailProgress = trailElapsed / trailDuration;
+            return trailProgress < 1 && this.trail.length > 0;
+          }
+  
+          return true;
+        }
+  
+        // Normal star drift (time-based for smooth movement)
+        this.x += this.vx * deltaTime;
+        this.y += this.vy * deltaTime;
+  
+        // Start fade the first time it actually becomes visible
+        if (!this.firstSeen && this.isOnScreen(0)) {
+          this.firstSeen = true;
+          this.creationTime = performance.now();
+          this.opacity = 0;
+        }
+  
+        if (!this.firstSeen) {
+          this.opacity = 0;
+          return true;
+        }
+  
+        const age = performance.now() - this.creationTime;
+        if (age < this.fadeInDuration) {
+          const p = age / this.fadeInDuration;
+          const eased = p * p;
+          this.opacity = this.baseOpacity * eased;
+        } else {
+          this.opacity = this.baseOpacity;
+        }
+  
+        return true;
+      }
+  
+      draw() {
+        if (this.isShooting) {
+          const elapsed = performance.now() - this.shootingStartTime;
+          const progress = Math.min(elapsed / this.shootingDuration, 1);
+          const isTrailPhase = progress >= 1;
+  
+          // Trail
+          if (this.trail.length > 1) {
+            ctx.save();
+            ctx.strokeStyle = '#FFF';
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+  
+            for (let i = 0; i < this.trail.length - 1; i++) {
+              const p1 = this.trail[i];
+              const p2 = this.trail[i + 1];
+  
+              const x1 = p1.x - viewportX;
+              const y1 = p1.y - viewportY;
+              const x2 = p2.x - viewportX;
+              const y2 = p2.y - viewportY;
+  
+              let trailOpacity = 1;
+              if (isTrailPhase) {
+                const pointAge = performance.now() - p1.time;
+                const trailDuration = 500;
+                trailOpacity = Math.max(0, 1 - pointAge / trailDuration);
+              } else {
+                const tp = i / this.trail.length;
+                trailOpacity = 0.3 + (1 - tp) * 0.7;
+              }
+  
+              ctx.globalAlpha = trailOpacity * 0.8;
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(x1, y1);
+              ctx.lineTo(x2, y2);
+              ctx.stroke();
+            }
+  
+            ctx.restore();
+          }
+  
+          // Head
+          if (!isTrailPhase && this.opacity > 0) {
+            const x = this.x - viewportX;
+            const y = this.y - viewportY;
+  
+            ctx.save();
+            ctx.globalAlpha = this.opacity;
+            const g = ctx.createRadialGradient(x, y, 0, x, y, this.size * 2);
+            g.addColorStop(0, 'rgba(255,255,255,1)');
+            g.addColorStop(0.5, 'rgba(255,255,255,0.5)');
+            g.addColorStop(1, 'rgba(255,255,255,0)');
+            ctx.fillStyle = g;
+            ctx.beginPath();
+            ctx.arc(x, y, this.size, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.restore();
+          }
+  
+          return;
+        }
+  
+        // Normal star
+        if (this.opacity <= 0) return;
+  
+        // Parallax effect: stars at different depths move at different speeds
+        // Close stars (depth ~0.5) move MORE relative to viewport (2x movement)
+        // Far stars (depth ~1.5) move LESS relative to viewport (0.67x movement)
+        // This creates the illusion of depth when panning
+        const x = this.x - viewportX / this.depth;
+        const y = this.y - viewportY / this.depth;
+  
+        ctx.save();
+        ctx.globalAlpha = this.opacity;
+        ctx.fillStyle = '#FFF';
+        ctx.beginPath();
+        ctx.arc(x, y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  
+    // -----------------------------
+    // Shooting star system (separate list)
+    // -----------------------------
+    let shootingStars = [];
+    let nextShootingStarTime = Date.now() + (Math.random() * 19000 + 1000);
+  
+    function createShootingStar() {
+      const edge = Math.floor(Math.random() * 4);
+      let x, y, targetX, targetY;
+  
+      const w = canvas.width;
+      const h = canvas.height;
+  
+      if (edge === 0) { // top
+        x = viewportX + Math.random() * w;
+        y = viewportY - 100;
+        targetX = viewportX + Math.random() * w;
+        targetY = viewportY + h + 100;
+      } else if (edge === 1) { // right
+        x = viewportX + w + 100;
+        y = viewportY + Math.random() * h;
+        targetX = viewportX - 100;
+        targetY = viewportY + Math.random() * h;
+      } else if (edge === 2) { // bottom
+        x = viewportX + Math.random() * w;
+        y = viewportY + h + 100;
+        targetX = viewportX + Math.random() * w;
+        targetY = viewportY - 100;
+      } else { // left
+        x = viewportX - 100;
+        y = viewportY + Math.random() * h;
+        targetX = viewportX + w + 100;
+        targetY = viewportY + Math.random() * h;
+      }
+  
+      const dx = targetX - x;
+      const dy = targetY - y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const angle = Math.atan2(dy, dx);
+      const speed = dist / 300; // px/ms
+  
+      const s = new Star(x, y, true);
+      s.vx = Math.cos(angle) * speed;
+      s.vy = Math.sin(angle) * speed;
+  
+      shootingStars.push(s);
+    }
+  
+    // -----------------------------
+    // Touch panning
+    // -----------------------------
+    function handleTouchStart(e) {
+      if (e.touches.length === 1) {
+        e.preventDefault();
+        isPanning = true;
+        velocityX = 0;
+        velocityY = 0;
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+        lastMoveTime = performance.now();
+      } else {
+        isPanning = false;
+      }
+    }
+  
+    function handleTouchMove(e) {
+      if (isPanning && e.touches.length === 1) {
+        e.preventDefault();
+  
+        const currentTime = performance.now();
+        const currentX = e.touches[0].clientX;
+        const currentY = e.touches[0].clientY;
+  
+        const dx = currentX - lastX;
+        const dy = currentY - lastY;
+  
+        viewportX -= dx;
+        viewportY -= dy;
+  
+        const timeDelta = currentTime - lastMoveTime;
+        if (timeDelta > 0) {
+          // velocity in viewport units per ms (matches momentum math below)
+          velocityX = (-dx) / timeDelta;
+          velocityY = (-dy) / timeDelta;
+        }
+  
+        lastX = currentX;
+        lastY = currentY;
+        lastMoveTime = currentTime;
+      }
+    }
+  
+    function handleTouchEnd(e) {
+      if (e.touches.length === 0) {
+        isPanning = false;
+      } else if (e.touches.length === 1) {
+        lastX = e.touches[0].clientX;
+        lastY = e.touches[0].clientY;
+      }
+    }
+  
+    // -----------------------------
+    // Trackpad / wheel panning (FIXED momentum consistency)
+    // -----------------------------
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function handleWheel(e) {
+      const isTrackpad = e.deltaMode === 0 && (Math.abs(e.deltaX) > 0 || Math.abs(e.deltaY) > 0);
+      if (!(isTrackpad || e.ctrlKey)) return;
+
+      e.preventDefault();
+      e.stopPropagation(); // prevents double-handling if you have wheel on body + canvas
+
+      const panSpeed = 0.6;
+      const dx = e.deltaX * panSpeed;
+      const dy = e.deltaY * panSpeed;
+
+      // Apply pan immediately
+      viewportX += dx;
+      viewportY += dy;
+
+      const now = performance.now();
+      let dt = now - lastWheelTime;
+      if (!isFinite(dt) || dt <= 0) dt = wheelDtMax;
+      dt = clamp(dt, wheelDtMin, wheelDtMax);
+
+      // Instantaneous velocity (px/ms)
+      const vx = dx / dt;
+      const vy = dy / dt;
+
+      // Smooth velocity to avoid spikes
+      velocityX = velocityX * (1 - wheelSmoothing) + vx * wheelSmoothing;
+      velocityY = velocityY * (1 - wheelSmoothing) + vy * wheelSmoothing;
+
+      // Clamp to prevent giant jumps
+      velocityX = clamp(velocityX, -maxWheelVelocity, maxWheelVelocity);
+      velocityY = clamp(velocityY, -maxWheelVelocity, maxWheelVelocity);
+
+      lastWheelTime = now;
+      wheelActiveUntil = now + wheelMomentumDelay;
+    }
+
+  
+    document.body.addEventListener('touchstart', handleTouchStart, { passive: false });
+    document.body.addEventListener('touchmove', handleTouchMove, { passive: false });
+    document.body.addEventListener('touchend', handleTouchEnd);
+    document.body.addEventListener('touchcancel', handleTouchEnd);
+  
+    canvas.addEventListener('touchstart', handleTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', handleTouchMove, { passive: false });
+    canvas.addEventListener('touchend', handleTouchEnd);
+    canvas.addEventListener('touchcancel', handleTouchEnd);
+  
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+  
+    // -----------------------------
+    // Animation loop
+    // -----------------------------
+    let lastTime = performance.now();
+  
+    function animate(currentTime) {
+      const deltaTime = currentTime - lastTime;
+      lastTime = currentTime;
+  
+      // Momentum
+      if (!isPanning && (Math.abs(velocityX) > minVelocity || Math.abs(velocityY) > minVelocity)) {
+        viewportX += velocityX * deltaTime;
+        viewportY += velocityY * deltaTime;
+  
+        velocityX *= Math.pow(friction, deltaTime / 16.67);
+        velocityY *= Math.pow(friction, deltaTime / 16.67);
+  
+        if (Math.abs(velocityX) < minVelocity) velocityX = 0;
+        if (Math.abs(velocityY) < minVelocity) velocityY = 0;
+      } else if (!isPanning) {
+        velocityX = 0;
+        velocityY = 0;
+      }
+  
+      // Clear
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+  
+      // Shooting star timing
+      if (Date.now() >= nextShootingStarTime) {
+        createShootingStar();
+        nextShootingStarTime = Date.now() + (Math.random() * 19000 + 1000);
+      }
+  
+      // Determine which cells to render
+      const margin = Math.max(canvas.width, canvas.height) * 1.5;
+      const minX = viewportX - margin;
+      const maxX = viewportX + canvas.width + margin;
+      const minY = viewportY - margin;
+      const maxY = viewportY + canvas.height + margin;
+  
+      const minCx = Math.floor(minX / CELL_SIZE);
+      const maxCx = Math.floor(maxX / CELL_SIZE);
+      const minCy = Math.floor(minY / CELL_SIZE);
+      const maxCy = Math.floor(maxY / CELL_SIZE);
+  
+      // Render stars from deterministic cells
+      const drawMargin = Math.max(canvas.width, canvas.height) * 1.5;
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        for (let cy = minCy; cy <= maxCy; cy++) {
+          const cell = getOrCreateCell(cx, cy, currentTime);
+          for (const star of cell.stars) {
+            star.update(deltaTime);
+  
+            // Only draw if reasonably near screen (performance)
+            if (star.isOnScreen(drawMargin)) {
+              star.draw();
+            }
+          }
+        }
+      }
+  
+      // Cleanup cell cache
+      cleanupCells(minCx, maxCx, minCy, maxCy, currentTime);
+  
+      // Update/draw shooting stars (always)
+      shootingStars = shootingStars.filter((s) => {
+        const alive = s.update(deltaTime);
+        if (alive) s.draw();
+        return alive;
+      });
+  
+      requestAnimationFrame(animate);
+    }
+  
+    requestAnimationFrame(animate);
+  </script>
+  
 </body>
 </html>
